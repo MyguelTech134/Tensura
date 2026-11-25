@@ -16,12 +16,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/configure-pages@v5
+
       - name: Spiel entpacken
         run: |
           unzip -q Slimebound-Web-0.1.zip -d _site
           test -s _site/index.html
-      - uses: actions/upload-pages-artifact@v4
+
+      - uses: actions/upload-pages-artifact@v5
+        id: upload
         with:
           path: _site
-      - id: pages
-        uses: actions/deploy-pages@v4
+
+      - name: Spiel veröffentlichen
+        id: pages
+        uses: actions/github-script@v8
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        with:
+          script: |
+            const artifact = Number(process.env.ARTIFACT_ID);
+            if (!Number.isSafeInteger(artifact) || artifact < 1) throw Error("Upload-ID fehlt.");
+            const token = await core.getIDToken();
+            core.setSecret(token);
+            const { data } = await github.request("POST /repos/{owner}/{repo}/pages/deployments", {
+              ...context.repo, artifact_id: artifact, pages_build_version: context.sha, oidc_token: token
+            });
+            core.setOutput("page_url", data.page_url);
+            const html = require("node:fs").readFileSync("_site/index.html", "utf8");
+            const marker = html.match(/name="slimebound-build" content="[a-f0-9]{64}"/)[0];
+            const url = new URL(data.page_url);
+            url.searchParams.set("check", context.sha);
+            for (let i = 0; i < 60; i++) {
+              try {
+                const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+                if (r.ok && (await r.text()).includes(marker)) return;
+              } catch (e) { core.warning(e.message); }
+              await new Promise(done => setTimeout(done, 5000));
+            }
+            throw Error("Die neue Spielversion ist am öffentlichen Link noch nicht sichtbar.");
