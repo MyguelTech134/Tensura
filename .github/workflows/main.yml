@@ -1,56 +1,126 @@
 name: Slimebound veröffentlichen
-on: [push, workflow_dispatch]
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+on: [push, workflow_dispatch]
+permissions: {}
+concurrency:
+  group: tensura-pages
+  cancel-in-progress: false
 
 jobs:
-  deploy:
-    if: github.ref_name == github.event.repository.default_branch
+  build:
+    if: github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.pages.outputs.page_url }}
+    permissions:
+      contents: read
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact_id }}
+      build_id: ${{ steps.unpack.outputs.build_id }}
+      pack_hash: ${{ steps.unpack.outputs.pack_hash }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/configure-pages@v5
-
-      - name: Spiel entpacken
+      - name: Neueste Web-ZIP entpacken und prüfen
+        id: unpack
         run: |
-          unzip -q Slimebound-Web-0.1.zip -d _site
-          test -s _site/index.html
-
-      - uses: actions/upload-pages-artifact@v5
+          archive=$(find . -maxdepth 1 -regextype posix-extended -regex './Slimebound-Web-[0-9]+(\.[0-9]+)*\.zip' -printf '%f\n' | sort -V | tail -1)
+          if [[ -z "$archive" ]]; then
+            echo "::error::Keine Slimebound-Web-ZIP im Hauptordner."
+            exit 1
+          fi
+          echo "Spielpaket: $archive"
+          unzip -q "$archive" -d _site
+          test -s _site/index.wasm
+          test -s _site/index.pck
+          build=$(sed -n 's/.*name="slimebound-build" content="\([a-f0-9]\{64\}\)".*/\1/p' _site/index.html)
+          [[ "$build" =~ ^[a-f0-9]{64}$ ]]
+          grep -qF "\"build\":\"$build\"" _site/slimebound-sw.js
+          echo "build_id=$build" >> "$GITHUB_OUTPUT"
+          echo "pack_hash=$(sha256sum _site/index.pck | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Spielpaket hochladen
         id: upload
+        uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
-      - name: Spiel veröffentlichen
-        id: pages
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      page_url: ${{ steps.publish.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Paket über seine Upload-ID veröffentlichen
+        id: publish
         uses: actions/github-script@v8
         env:
-          ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact }}
         with:
           script: |
-            const artifact = Number(process.env.ARTIFACT_ID);
-            if (!Number.isSafeInteger(artifact) || artifact < 1) throw Error("Upload-ID fehlt.");
+            const id = Number(process.env.ARTIFACT_ID);
+            if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Die Upload-ID fehlt.");
             const token = await core.getIDToken();
             core.setSecret(token);
             const { data } = await github.request("POST /repos/{owner}/{repo}/pages/deployments", {
-              ...context.repo, artifact_id: artifact, pages_build_version: context.sha, oidc_token: token
+              ...context.repo, artifact_id: id, pages_build_version: context.sha, oidc_token: token
             });
+            const deployment = data.id || context.sha;
             core.setOutput("page_url", data.page_url);
-            const html = require("node:fs").readFileSync("_site/index.html", "utf8");
-            const marker = html.match(/name="slimebound-build" content="[a-f0-9]{64}"/)[0];
-            const url = new URL(data.page_url);
-            url.searchParams.set("check", context.sha);
-            for (let i = 0; i < 60; i++) {
-              try {
-                const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
-                if (r.ok && (await r.text()).includes(marker)) return;
-              } catch (e) { core.warning(e.message); }
-              await new Promise(done => setTimeout(done, 5000));
+            core.info(`Pages-Auftrag ${deployment}, Artefakt ${id}, Ziel ${data.page_url}`);
+            const failed = ["deployment_failed", "deployment_content_failed", "deployment_cancelled", "deployment_lost", "failed", "cancelled"];
+            let last = "";
+            for (let attempt = 0; attempt < 120; attempt++) {
+              const { data: result } = await github.request("GET /repos/{owner}/{repo}/pages/deployments/{deployment}", {
+                ...context.repo, deployment
+              });
+              if (result.status !== last) core.info(`Pages meldet: ${result.status}`);
+              last = result.status;
+              if (last === "succeed") return;
+              if (failed.includes(last)) {
+                throw Error(`Pages-Auftrag ${deployment}: ${last}. ${result.error?.message || result.message || ""}`);
+              }
+              await new Promise(resolve => setTimeout(resolve, 5000));
             }
-            throw Error("Die neue Spielversion ist am öffentlichen Link noch nicht sichtbar.");
+            throw Error(`Pages-Auftrag ${deployment}: nach zehn Minuten noch ${last}.`);
+
+  verify:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Öffentlichen Spiellink mit dem hochgeladenen Spielpaket vergleichen
+        env:
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+          BUILD_ID: ${{ needs.build.outputs.build_id }}
+          PACK_HASH: ${{ needs.build.outputs.pack_hash }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=${PAGE_URL%/}
+          until_time=$((SECONDS + 300))
+          attempt=0
+          while (( SECONDS < until_time )); do
+            attempt=$((attempt + 1))
+            query="release=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$attempt"
+            fetch() {
+              curl --fail --silent --show-error --location --max-time 10 \
+                -H 'Cache-Control: no-cache' "$base/$1?$query" -o "$RUNNER_TEMP/$2"
+            }
+            if fetch "" page.html && fetch slimebound-sw.js worker.js && fetch index.pck game.pck; then
+              live_build=$(sed -n 's/.*name="slimebound-build" content="\([a-f0-9]\{64\}\)".*/\1/p' "$RUNNER_TEMP/page.html")
+              live_pack=$(sha256sum "$RUNNER_TEMP/game.pck" | cut -d' ' -f1)
+              if [[ "$live_build" == "$BUILD_ID" && "$live_pack" == "$PACK_HASH" ]] &&
+                 grep -qF "\"build\":\"$BUILD_ID\"" "$RUNNER_TEMP/worker.js"; then
+                echo "Spielversion bestätigt: $BUILD_ID"
+                exit 0
+              fi
+              echo "Versuch $attempt: Seite ${live_build:-unbekannt}, Spieldaten $live_pack."
+            fi
+            sleep 8
+          done
+          echo "::error::Pages hat die Veröffentlichung bestätigt, der Spiellink liefert noch andere Dateien. Erwartet: $BUILD_ID (Seite), $PACK_HASH (Spieldaten)."
+          exit 1
